@@ -1,261 +1,297 @@
-/*
-The Example Media Server.  It takes an RTMP stream, segments it into a HLS stream, and transcodes it so it's available for Adaptive Bitrate Streaming.
-*/
 package main
 
 import (
 	"context"
-	"flag"
-	"fmt"
-	"io/ioutil"
-	"math/rand"
+	"errors"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/livepeer/lpms/transcoder"
-
 	"github.com/golang/glog"
-	"github.com/livepeer/lpms/core"
-	"github.com/livepeer/lpms/ffmpeg"
+
 	"github.com/livepeer/lpms/segmenter"
+
+	"github.com/google/uuid"
+	"github.com/livepeer/lpms/core"
 	"github.com/livepeer/lpms/stream"
 	"github.com/livepeer/m3u8"
 )
 
-func getOpts(opts *core.LPMSOpts) {
-	//opts.RtmpAddr = "127.0.0.1:1935"
-	//opts.HttpAddr = "127.0.0.1:7935"
-	opts.RtmpAddr = "0.0.0.0:1935"
-	opts.HttpAddr = "0.0.0.0:7935"
-	opts.WorkDir = "/tmp"
+const hlsManifestLength uint = 3
+const hlsWaitTime = time.Second * 10
+
+type CustomAppData struct {
+	streamID         string
+	manifestID       string
+	variantID        string
+	cancelSegmenting context.CancelFunc
 }
 
-var HLSWaitTime = time.Second * 10
-
-type exampleStream string
-
-func (t *exampleStream) StreamID() string {
-	return string(*t)
+func (s *CustomAppData) StreamID() string {
+	return s.streamID
 }
 
-func randString(n int) string {
-	rand.Seed(time.Now().UnixNano())
-	x := make([]byte, n, n)
-	for i := 0; i < len(x); i++ {
-		x[i] = byte(rand.Uint32())
+type RTMPStreamData struct {
+	rtmpStream stream.RTMPVideoStream
+}
+
+type HLSMasterManifest struct {
+	manifest *stream.BasicHLSVideoManifest
+}
+type HLSVariantData struct {
+	hlsStream stream.HLSVideoStream
+}
+
+type RTMPStreamMap map[string]RTMPStreamData
+type HLSMasterMap map[string]HLSMasterManifest
+type HLSVariantMap map[string]HLSVariantData
+
+func generateUUID() string {
+	id, err := uuid.NewRandom() // v4 secure UUID
+	if err != nil {
+		panic(err)
 	}
-	return fmt.Sprintf("%x", x)
+	return id.String()
 }
 
-func parseStreamID(reqPath string) string {
-	var strmID string
-	regex, _ := regexp.Compile("\\/stream\\/([[:alpha:]]|\\d)*")
-	match := regex.FindString(reqPath)
+func parseRTMPStreamKey(path string) (string, bool) {
+	var streamID string
+	regex, _ := regexp.Compile("\\/stream\\/([[:alpha:]]|\\d|\\-)*")
+	match := regex.FindString(path)
 	if match != "" {
-		strmID = strings.Replace(match, "/stream/", "", -1)
+		streamID = strings.Replace(match, "/stream/", "", -1)
+		return streamID, true
 	}
-	return strmID
+	return "", false
 }
 
-func getHLSSegmentName(url *url.URL) string {
+func parseHLSManifestID(path string) (string, bool) {
+	regex, _ := regexp.Compile("\\/stream\\/((?:[[:alpha:]]|\\d|\\-)*)_?.*(?:(?:\\.m3u8)|(?:\\.ts))")
+	matches := regex.FindStringSubmatch(path)
+	if len(matches) > 1 {
+		return matches[1], true
+	}
+	return "", false
+}
+
+func parseHLSSegmentName(path string) (string, bool) {
 	var segName string
 	regex, _ := regexp.Compile("\\/stream\\/.*\\.ts")
-	match := regex.FindString(url.Path)
+	match := regex.FindString(path)
 	if match != "" {
 		segName = strings.Replace(match, "/stream/", "", -1)
+		return segName, true
 	}
-	return segName
+	return "", false
 }
 
 func main() {
-	flag.Set("logtostderr", "true")
-	flag.Parse()
-
-	dir, err := os.Getwd()
-	if err != nil {
-		glog.Infof("Error getting work directory: %v", err)
+	opts := core.LPMSOpts{
+		RtmpAddr: "0.0.0.0:1935",
+		HttpAddr: "0.0.0.0:7935",
+		WorkDir:  "/tmp",
 	}
-	glog.Infof("Setting working directory %v", fmt.Sprintf("%v/.tmp", dir))
-	opts := core.LPMSOpts{}
-	getOpts(&opts)
 	lpms := core.New(&opts)
+	rtmpStreams := make(RTMPStreamMap)
+	hlsMasterManifests := make(HLSMasterMap)
+	hlsVariants := make(HLSVariantMap)
 
-	//Streams needed for transcoding:
-	var rtmpStrm stream.RTMPVideoStream
-	var hlsStrm stream.HLSVideoStream
-	var manifest stream.HLSVideoManifest
-	var cancelSeg context.CancelFunc
-
-	glog.Infof("Setting publish handle")
+	// handle RTMP publish
 	lpms.HandleRTMPPublish(
-		//makeStreamID (give the stream an ID)
-		func(url *url.URL) stream.AppData {
-			s := exampleStream(randString(10))
-			return &s
-		},
+		createRTMPStreamIDHandler(),
+		createRTMPStreamHandler(lpms, rtmpStreams, hlsMasterManifests, hlsVariants),
+		createRTMPStreamEndHandler(rtmpStreams, hlsMasterManifests, hlsVariants))
 
-		//gotStream
-		func(url *url.URL, rs stream.RTMPVideoStream) (err error) {
-			//Store the stream
-			glog.Infof("Got RTMP stream: %v", rs.GetStreamID())
-			rtmpStrm = rs
-
-			// //Segment the video into HLS (If we need multiple outlets for the HLS stream, we'd need to create a buffer.  But here we only have one outlet for the transcoder)
-			hlsStrm = stream.NewBasicHLSVideoStream(randString(10), 3)
-			// var subscriber func(*stream.HLSSegment, bool)
-			// subscriber, err = transcode(hlsStrm)
-			// if err != nil {
-			// 	glog.Errorf("Error transcoding: %v", err)
-			// }
-			// hlsStrm.SetSubscriber(subscriber)
-			// glog.Infof("After set subscriber")
-			opt := segmenter.SegmenterOptions{SegLength: 8 * time.Second}
-			var ctx context.Context
-			ctx, cancelSeg = context.WithCancel(context.Background())
-
-			//Kick off FFMpeg to create segments
-			go func() {
-				if err := lpms.SegmentRTMPToHLS(ctx, rtmpStrm, hlsStrm, opt); err != nil {
-					glog.Errorf("Error segmenting RTMP video stream: %v", err)
-				}
-			}()
-			glog.Infof("HLS StreamID: %v", hlsStrm.GetStreamID())
-
-			// mid := randString(10)
-			// manifest = stream.NewBasicHLSVideoManifest(mid)
-			// pl, _ := hlsStrm.GetStreamPlaylist()
-			// variant := &m3u8.Variant{URI: fmt.Sprintf("%v.m3u8", mid), Chunklist: pl, VariantParams: m3u8.VariantParams{}}
-			// manifest.AddVideoStream(hlsStrm, variant)
-			return nil
-		},
-		//endStream
-		func(url *url.URL, rtmpStrm stream.RTMPVideoStream) error {
-			glog.Infof("Ending stream for %v", hlsStrm.GetStreamID())
-			//Remove the stream
-			cancelSeg()
-			rtmpStrm = nil
-			hlsStrm = nil
-			return nil
-		})
-
-	glog.Infof("Setting HLS play handle")
-	lpms.HandleHLSPlay(
-		//getMasterPlaylist
-		func(url *url.URL) (*m3u8.MasterPlaylist, error) {
-			if parseStreamID(url.Path) == "transcoded" && hlsStrm != nil {
-				mpl, err := manifest.GetManifest()
-				if err != nil {
-					glog.Errorf("Error getting master playlist: %v", err)
-					return nil, err
-				}
-				glog.Infof("Master Playlist: %v", mpl.String())
-				return mpl, nil
-			}
-			return nil, nil
-		},
-		//getMediaPlaylist
-		func(url *url.URL) (*m3u8.MediaPlaylist, error) {
-			if nil == hlsStrm {
-				return nil, fmt.Errorf("No stream available")
-			}
-			//Wait for the HLSBuffer gets populated, get the playlist from the buffer, and return it.
-			start := time.Now()
-			for time.Since(start) < HLSWaitTime {
-				pl, err := hlsStrm.GetStreamPlaylist()
-				if err != nil || pl == nil || pl.Segments == nil || len(pl.Segments) <= 0 || pl.Segments[0] == nil || pl.Segments[0].URI == "" {
-					if err == stream.ErrEOF {
-						return nil, err
-					}
-
-					time.Sleep(2 * time.Second)
-					continue
-				} else {
-					return pl, nil
-				}
-			}
-			return nil, fmt.Errorf("Error getting playlist")
-		},
-		//getSegment
-		func(url *url.URL) ([]byte, error) {
-			seg, err := hlsStrm.GetHLSSegment(getHLSSegmentName(url))
-			if err != nil {
-				glog.Errorf("Error getting segment: %v", err)
-				return nil, err
-			}
-			return seg.Data, nil
-		})
-
-	glog.Infof("Setting RTMP play handle")
 	lpms.HandleRTMPPlay(
-		//getStream
-		func(url *url.URL) (stream.RTMPVideoStream, error) {
-			glog.Infof("Got req: %v", url.Path)
-			if rtmpStrm != nil {
-				strmID := parseStreamID(url.Path)
-				if strmID == rtmpStrm.GetStreamID() {
-					return rtmpStrm, nil
-				}
-			}
-			return nil, fmt.Errorf("Cannot find stream")
-		})
+		createRTMPPlayHandler(rtmpStreams))
 
-	glog.Infof("Starting...")
+	// handle HLS play
+	lpms.HandleHLSPlay(
+		createHLSMasterPlaylistHandler(hlsMasterManifests),
+		createHLSMediaPlaylistHandler(hlsVariants),
+		createHLSSegmentHandler(hlsVariants))
 	lpms.Start(context.Background())
 }
 
-func transcode(hlsStream stream.HLSVideoStream) (func(*stream.HLSSegment, bool), error) {
-	//Create Transcoder
-	profiles := []ffmpeg.VideoProfile{
-		ffmpeg.P144p30fps16x9,
-		ffmpeg.P240p30fps16x9,
-		ffmpeg.P576p30fps16x9,
+func authenticateRTMPPublish(streamKey string) (string, error) {
+	return generateUUID(), nil // TODO: auth, also fixed HLS manifest URLs
+}
+
+func createRTMPStreamIDHandler() func(*url.URL) stream.AppData {
+	return func(url *url.URL) stream.AppData {
+		streamKey, ok := parseRTMPStreamKey(url.Path)
+		if !ok {
+			glog.Errorf("Empty streamKey during RTMP authentication")
+			return nil
+		}
+		manifestID, err := authenticateRTMPPublish(streamKey)
+		if err != nil {
+			glog.Errorf("RTMP authentication failed: %v", err)
+			return nil
+		}
+
+		appData := CustomAppData{
+			streamID:   generateUUID(),
+			variantID:  generateUUID(), // TODO: multiple variants
+			manifestID: manifestID,
+		}
+		return &appData
 	}
-	workDir := "./tmp"
-	t := transcoder.NewFFMpegSegmentTranscoder(profiles, workDir)
+}
 
-	//Create variants in the stream
-	strmIDs := make([]string, len(profiles), len(profiles))
-	// for i, p := range profiles {
-	// 	strmID := randString(10)
-	// 	strmIDs[i] = strmID
-	// 	pl, _ := m3u8.NewMediaPlaylist(100, 100)
-	// 	// hlsStream.AddVariant(strmID, &m3u8.Variant{URI: fmt.Sprintf("%v.m3u8", strmID), Chunklist: pl, VariantParams: transcoder.TranscodeProfileToVariantParams(p)})
-	// }
+func createRTMPStreamHandler(lpms *core.LPMS, rtmpStreams RTMPStreamMap, hlsMasters HLSMasterMap, hlsVariants HLSVariantMap) func(*url.URL, stream.RTMPVideoStream) error {
+	return func(url *url.URL, rtmpStream stream.RTMPVideoStream) error {
+		var hlsStream stream.HLSVideoStream
+		appData, ok := rtmpStream.AppData().(*CustomAppData)
+		if !ok {
+			return errors.New("Mismatched app data type.")
+		}
+		manifest := stream.NewBasicHLSVideoManifest(appData.manifestID)
 
-	subscriber := func(seg *stream.HLSSegment, eof bool) {
-		//If we get a new video segment for the original HLS stream, do the transcoding.
-		// glog.Infof("Got seg: %v", seg.Name)
-		// if strmID == hlsStream.GetStreamID() {
-		file, err := ioutil.TempFile(workDir, "example")
+		// TODO: multiple variants
+		hlsStream = stream.NewBasicHLSVideoStream(appData.variantID, hlsManifestLength)
+		pl, err := hlsStream.GetStreamPlaylist()
+
 		if err != nil {
-			glog.Errorf("Unable to get tempdir, %v", err)
-		}
-		defer os.Remove(file.Name())
-		if _, err = file.Write(seg.Data); err != nil {
-			glog.Errorf("Unable to write temp file %v", err)
-		}
-		if err = file.Close(); err != nil {
-			glog.Errorf("Unable to close file: %v", err)
+			glog.Errorf("Error creating HLS stream playlist: %v", err)
+			return err
 		}
 
-		//Transcode stream
-		tData, err := t.Transcode(file.Name())
+		err = manifest.AddVideoStream(hlsStream, &m3u8.Variant{URI: appData.variantID + ".m3u8", Chunklist: pl, VariantParams: m3u8.VariantParams{Bandwidth: 100}})
 		if err != nil {
-			glog.Errorf("Error transcoding: %v", err)
+			glog.Errorf("Error adding variant to HLS manifest: %v", err)
+			return err
 		}
 
-		//Insert into HLS stream
-		for i, strmID := range strmIDs {
-			glog.Infof("Inserting transcoded seg %v into strm: %v", len(tData[i]), strmID)
-			if err := hlsStream.AddHLSSegment(&stream.HLSSegment{SeqNo: seg.SeqNo, Name: fmt.Sprintf("%v_%v.ts", strmID, seg.SeqNo), Data: tData[i], Duration: 8}); err != nil {
-				glog.Errorf("Error writing transcoded seg: %v", err)
+		opt := segmenter.SegmenterOptions{SegLength: 8 * time.Second}
+		bgContext, cancel := context.WithCancel(context.Background())
+		appData.cancelSegmenting = cancel
+
+		// TODO: multiple variants
+		hlsMasters[appData.manifestID] = HLSMasterManifest{
+			manifest: manifest,
+		}
+		hlsVariants[appData.variantID] = HLSVariantData{
+			hlsStream: hlsStream,
+		}
+		rtmpStreams[appData.streamID] = RTMPStreamData{
+			rtmpStream: rtmpStream,
+		}
+
+		go func() {
+			err := lpms.SegmentRTMPToHLS(bgContext, rtmpStream, hlsStream, opt)
+			if err != nil {
+				glog.Errorf("Error segmenting RTMP video stream: %v", err)
+				rtmpStream.Close()
+			}
+		}()
+
+		glog.Info("Publishing RTMP to http://localhost:7935/stream/", appData.manifestID, ".m3u8")
+		glog.Info("Created manifest with ID ", appData.manifestID, " and variant ID ", appData.variantID)
+
+		return nil
+	}
+}
+
+func createRTMPStreamEndHandler(rtmpStreams RTMPStreamMap, hlsMasters HLSMasterMap, hlsVariants HLSVariantMap) func(*url.URL, stream.RTMPVideoStream) (err error) {
+	return func(url *url.URL, rtmpStream stream.RTMPVideoStream) (err error) {
+		appData, ok := rtmpStream.AppData().(*CustomAppData)
+		if !ok {
+			return errors.New("Mismatched app data type.")
+		}
+		glog.Info("RTMP stream ended.")
+		appData.cancelSegmenting()
+		delete(rtmpStreams, appData.streamID)
+		delete(hlsMasters, appData.manifestID)
+		delete(hlsVariants, appData.variantID) // TODO: multiple variants
+		return nil
+	}
+}
+
+func createRTMPPlayHandler(rtmpStreams RTMPStreamMap) func(*url.URL) (stream.RTMPVideoStream, error) {
+	return func(url *url.URL) (stream.RTMPVideoStream, error) {
+		streamID, ok := parseRTMPStreamKey(url.Path)
+		if !ok {
+			return nil, errors.New("Empty stream ID in RTMP playback.")
+		}
+		rtmpData, ok := rtmpStreams[streamID]
+		if !ok {
+			return nil, errors.New("No matching stream found for RTMP playback.")
+		}
+		return rtmpData.rtmpStream, nil
+	}
+}
+
+func createHLSMasterPlaylistHandler(hlsMasters HLSMasterMap) func(*url.URL) (*m3u8.MasterPlaylist, error) {
+	return func(url *url.URL) (*m3u8.MasterPlaylist, error) {
+		manifestID, ok := parseHLSManifestID(url.Path)
+		if !ok {
+			glog.Info(url.Path)
+			return nil, errors.New("Empty master manifest ID in HLS playback.")
+		}
+		hlsData, ok := hlsMasters[manifestID]
+		if !ok {
+			return nil, nil // allow fallthrough to media
+		}
+
+		manifest, err := hlsData.manifest.GetManifest() // TODO: actually return the master playlist
+		return manifest, err
+	}
+}
+
+func createHLSMediaPlaylistHandler(hlsVariants HLSVariantMap) func(*url.URL) (*m3u8.MediaPlaylist, error) {
+	return func(url *url.URL) (*m3u8.MediaPlaylist, error) {
+		variantID, ok := parseHLSManifestID(url.Path)
+		if !ok {
+			return nil, errors.New("Empty media manifest ID in HLS playback.")
+		}
+		hlsData, ok := hlsVariants[variantID]
+		if !ok {
+			return nil, errors.New("No matching stream found for HLS playback.")
+		}
+
+		// wait for HLSBuffer to be populated
+		start := time.Now()
+		for time.Since(start) < hlsWaitTime {
+			pl, err := hlsData.hlsStream.GetStreamPlaylist()
+			if err != nil || pl == nil || pl.Segments == nil || len(pl.Segments) <= 0 || pl.Segments[0] == nil || pl.Segments[0].URI == "" {
+				if err == stream.ErrEOF {
+					return nil, err
+				}
+
+				time.Sleep(time.Second)
+				continue
+			} else {
+				return pl, nil
 			}
 		}
-		// }
+		return nil, errors.New("Error getting playlist")
 	}
+}
 
-	return subscriber, nil
+func createHLSSegmentHandler(hlsVariants HLSVariantMap) func(url *url.URL) ([]byte, error) {
+	return func(url *url.URL) ([]byte, error) {
+		manifestID, ok := parseHLSManifestID(url.Path)
+		if !ok {
+			return nil, errors.New("Could not parse manifest ID for HLS play.")
+		}
+		hlsData, ok := hlsVariants[manifestID]
+		if !ok {
+			return nil, errors.New("No matching stream found for HLS play.")
+		}
+
+		segmentName, ok := parseHLSSegmentName(url.Path)
+		if !ok {
+			return nil, errors.New("Empty segment name for HLS play.")
+		}
+
+		// TODO: parse out variant
+		segment, err := hlsData.hlsStream.GetHLSSegment(segmentName)
+		if err != nil {
+			glog.Errorf("Error getting segment: %v", err)
+			return nil, err
+		}
+		return segment.Data, nil
+	}
 }
