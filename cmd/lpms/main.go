@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io/ioutil"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -18,8 +22,16 @@ import (
 	"github.com/livepeer/m3u8"
 )
 
+const authHost = "http://localhost:8001/auth"
 const hlsManifestLength uint = 3
 const hlsWaitTime = time.Second * 10
+
+type JSONAuthRequest struct {
+	StreamKey string
+}
+type JSONAuthResponse struct {
+	ManifestID string
+}
 
 type CustomAppData struct {
 	streamID         string
@@ -112,10 +124,28 @@ func main() {
 		createHLSMediaPlaylistHandler(hlsVariants),
 		createHLSSegmentHandler(hlsVariants))
 	lpms.Start(context.Background())
+	glog.Info("Server running...")
 }
 
 func authenticateRTMPPublish(streamKey string) (string, error) {
-	return generateUUID(), nil // TODO: auth, also fixed HLS manifest URLs
+	b, err := json.Marshal(JSONAuthRequest{streamKey})
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.Post(authHost, "application/json", bytes.NewBuffer(b))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+
+	var m JSONAuthResponse
+	err = json.Unmarshal(body, &m)
+	if err != nil {
+		return "", err
+	}
+
+	return m.ManifestID, nil
 }
 
 func createRTMPStreamIDHandler() func(*url.URL) stream.AppData {
