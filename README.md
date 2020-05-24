@@ -11,8 +11,8 @@ docker run -p 1935:1935 -p 7935:7935 eventdrip:1.0
 
 ## Web API
 
-Validate a stream key and return the corresponding manifest ID.
 ### `POST /auth`
+Validate a stream key and return the corresponding manifest ID.
 ```javascript
 {
    StreamKey: "STREAM_KEY",
@@ -24,8 +24,8 @@ Validate a stream key and return the corresponding manifest ID.
 }
 ```
 
+### `GET /new`
 Create a new stream key / manifest ID pair.
-## `GET /new`
 ```javascript
 {
    streamKey: "STREAM_KEY",
