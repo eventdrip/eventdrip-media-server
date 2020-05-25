@@ -6,7 +6,10 @@ Access HLS stream at `http://localhost:7935/stream/<PUBLIC_STREAM_ID>.m3u8`
 ## Run in Docker
 ```
 docker build --tag eventdrip:1.0 .
-docker run -p 1935:1935 -p 7935:7935 eventdrip:1.0
+docker run --network="host" -e AUTH_HOST="http://localhost:8001/auth" eventdrip:1.0
+```
+```
+node ./web-api/app.js
 ```
 
 ## Web API

@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"github.com/livepeer/m3u8"
 )
 
-const authHost = "http://localhost:8001/auth"
 const hlsManifestLength uint = 3
 const hlsWaitTime = time.Second * 10
 
@@ -132,6 +132,7 @@ func authenticateRTMPPublish(streamKey string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	authHost := os.Getenv("AUTH_HOST")
 	resp, err := http.Post(authHost, "application/json", bytes.NewBuffer(b))
 	if err != nil {
 		return "", err
