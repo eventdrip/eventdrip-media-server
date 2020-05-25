@@ -14,8 +14,8 @@ node ./web-api/app.js
 
 ## Web API
 
-Validate a stream key and return the corresponding manifest ID.
 ### `POST /auth`
+Validate a stream key and return the corresponding manifest ID.
 ```javascript
 {
    StreamKey: "STREAM_KEY",
@@ -27,8 +27,8 @@ Validate a stream key and return the corresponding manifest ID.
 }
 ```
 
+### `GET /new`
 Create a new stream key / manifest ID pair.
-## `GET /new`
 ```javascript
 {
    streamKey: "STREAM_KEY",
